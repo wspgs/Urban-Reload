@@ -1,0 +1,1204 @@
+-- Check for table that is shared between executions.
+if not shared then
+	return warn("No shared, no script.")
+end
+
+-- Services.
+local playersService = game:GetService("Players")
+local runService = game:GetService("RunService")
+local userInputService = game:GetService("UserInputService")
+local replicatedStorage = game:GetService("ReplicatedStorage")
+
+-- Constants.
+local UI_URL = "https://raw.githubusercontent.com/wspgs/Tangui.2/refs/heads/main/ui"
+local ROLL_INTERVAL = 0.25
+local RAYCAST_MIN_LENGTH = 15
+local RAYCAST_MAX_ORIGIN_OFFSET = 20
+local RAY_EXTRA_LENGTH = 10
+local STICKY_FOV_SCALE = 3
+
+-- Detach the previous execution so hooks pass through.
+if shared.TangHub then
+	pcall(shared.TangHub.detach)
+end
+
+local TangHub = { alive = true, connections = {} }
+shared.TangHub = TangHub
+
+-- State.
+local localPlayer = playersService.LocalPlayer
+local currentCamera = workspace.CurrentCamera
+local aimPart = nil
+local aimIsHitbox = false
+local aimRoot = nil
+local lockedPlayer = nil
+local kickBlocked = 0
+local clientHitboxes = nil
+local hitboxModel = nil
+local clientState = nil
+local clientConfig = nil
+local healBusy = false
+local lastNameApply = 0
+local lastNameText = nil
+local lastAutoHeal = 0
+local lastRoll = 0
+local rolledHead = true
+local espObjects = {}
+local window = nil
+local fovGui = nil
+local fovCircle = nil
+local espGui = nil
+
+local state = {
+	enabled = false,
+	showFov = true,
+	wallCheck = true,
+	targetSeated = true,
+	fov = 150,
+	hitChance = 100,
+	prediction = 0,
+	maxAngle = 45,
+	autoPredict = true,
+	targetMode = "หัว",
+	rayMode = false,
+	raycastMode = true,
+	antiKick = true,
+	infiniteStamina = false,
+	autoHeal = false,
+	autoArmor = false,
+	healPercent = 50,
+	healItem = "Medkit",
+	nameEnabled = false,
+	nameText = "GOD",
+	redirect = true,
+	espEnabled = false,
+	espTracers = true,
+	espBoxes = true,
+	espNames = true,
+	espHealth = true,
+	espDistance = 1500,
+	espColor = Color3.fromRGB(255, 60, 60),
+}
+
+local visibilityParams = RaycastParams.new()
+visibilityParams.FilterType = Enum.RaycastFilterType.Exclude
+pcall(function()
+	visibilityParams.CollisionGroup = "Bullet"
+end)
+
+---Fetch a url with the custom request function.
+---@param url string
+---@return string?
+local function fetch(url)
+	local success, response = pcall(request, { Url = url, Method = "GET" })
+	if not success or not response or response.StatusCode ~= 200 then
+		return nil
+	end
+	return response.Body
+end
+
+---Outermost vehicle model of a seat.
+---@param seat BasePart
+---@return Model?
+local function getVehicleModel(seat)
+	local model = seat:FindFirstAncestorOfClass("Model")
+	while model and model.Parent and model.Parent:IsA("Model") do
+		model = model.Parent
+	end
+	return model
+end
+
+---Require a game module with a low identity so our environment does not leak.
+---@param name string
+---@return table?
+local function loadGameModule(name)
+	local weapons = replicatedStorage:FindFirstChild("Weapons")
+	local moduleScript = weapons and weapons:FindFirstChild(name)
+	if not moduleScript then
+		return nil
+	end
+
+	local previous = getthreadidentity()
+	setthreadidentity(2)
+	local success, result = pcall(require, moduleScript)
+	setthreadidentity(previous)
+
+	return success and result or nil
+end
+
+---Find the server-side hitbox part the game really shoots at.
+---@param character Model
+---@param wantHead boolean
+---@return BasePart?
+local function getHitboxPart(character, wantHead)
+	if not (clientHitboxes and clientHitboxes.folders and clientHitboxes.parts) then
+		return nil
+	end
+
+	local folder = clientHitboxes.folders[character]
+	if not folder then
+		return nil
+	end
+
+	local root = character:FindFirstChild("HumanoidRootPart")
+	local best, bestScore = nil, math.huge
+
+	for _, part in ipairs(folder:GetDescendants()) do
+		if not part:IsA("BasePart") then
+			continue
+		end
+
+		local info = clientHitboxes.parts[part]
+		if not info then
+			continue
+		end
+
+		local isHead = hitboxModel and hitboxModel.HEAD and hitboxModel.HEAD[info.name] == true
+		if wantHead then
+			if isHead then
+				return part
+			end
+		elseif not isHead then
+			local score = root and (part.Position - root.Position).Magnitude or 0
+			if score < bestScore then
+				best, bestScore = part, score
+			end
+		end
+	end
+
+	return best
+end
+
+---Is the position visible from the camera, same filter the bullets use.
+---@param position Vector3
+---@param character Model
+---@param humanoid Humanoid
+---@return boolean
+local function isVisible(position, character, humanoid)
+	local filter = { character }
+	local fxFolder = workspace:FindFirstChild("FX")
+	if fxFolder then
+		table.insert(filter, fxFolder)
+	end
+
+	if clientHitboxes and clientHitboxes.folders then
+		local targetFolder = clientHitboxes.folders[character]
+		local ownFolder = localPlayer.Character and clientHitboxes.folders[localPlayer.Character]
+		if targetFolder then
+			table.insert(filter, targetFolder)
+		end
+		if ownFolder then
+			table.insert(filter, ownFolder)
+		end
+	end
+
+	if localPlayer.Character then
+		table.insert(filter, localPlayer.Character)
+	end
+
+	-- Drivers sit behind the car body, ignore the vehicle.
+	local seat = humanoid.SeatPart
+	if seat then
+		local vehicle = getVehicleModel(seat)
+		if vehicle then
+			table.insert(filter, vehicle)
+		end
+	end
+
+	local origin = currentCamera.CFrame.Position
+	local direction = position - origin
+
+	-- Bullets pass through glass.
+	for _ = 1, 6 do
+		visibilityParams.FilterDescendantsInstances = filter
+
+		local result = workspace:Raycast(origin, direction, visibilityParams)
+		if not result then
+			return true
+		end
+
+		if result.Instance.Name:sub(1, 6) ~= "Glass_" then
+			return false
+		end
+
+		table.insert(filter, result.Instance)
+	end
+
+	return false
+end
+
+---Pick the part to aim at on a character. Prefers the hitbox the server checks.
+---@param character Model
+---@return BasePart?, boolean
+local function pickPart(character)
+	local wantHead = state.targetMode == "หัว" or (state.targetMode == "สุ่ม" and rolledHead)
+
+	local hitbox = getHitboxPart(character, wantHead) or getHitboxPart(character, not wantHead)
+	if hitbox then
+		return hitbox, true
+	end
+
+	if wantHead then
+		local head = character:FindFirstChild("Head")
+		if head then
+			return head, false
+		end
+	end
+
+	return character:FindFirstChild("UpperTorso")
+		or character:FindFirstChild("Torso")
+		or character:FindFirstChild("HumanoidRootPart"),
+		false
+end
+
+---Lead time in seconds used to predict moving targets.
+---@return number
+local function getLeadTime()
+	if state.autoPredict then
+		local success, ping = pcall(function()
+			return localPlayer:GetNetworkPing()
+		end)
+		return (success and ping or 0) + 0.03
+	end
+
+	return state.prediction / 1000
+end
+
+---Current aim position, read live so it matches the hitbox at the moment of the shot.
+---@return Vector3?
+local function getAimPosition()
+	if not aimPart or not aimPart.Parent then
+		return nil
+	end
+
+	local position = aimPart.Position
+	local lead = getLeadTime()
+
+	-- Lead by the root velocity so running targets are still hit.
+	if lead > 0 and aimRoot and aimRoot.Parent then
+		position = position + aimRoot.AssemblyLinearVelocity * lead
+	end
+
+	return position
+end
+
+---Check if a player is a valid target and return its aim part.
+---@param player Player
+---@param limit number
+---@param mousePosition Vector2
+---@param cameraCFrame CFrame
+---@return BasePart?, boolean, number, BasePart?
+local function evaluateTarget(player, limit, mousePosition, cameraCFrame)
+	local character = player.Character
+	if not character then
+		return nil, false, 0, nil
+	end
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not (humanoid and root and humanoid.Health > 0) then
+		return nil, false, 0, nil
+	end
+
+	if humanoid.SeatPart and not state.targetSeated then
+		return nil, false, 0, nil
+	end
+
+	-- Spawn shield targets cannot be damaged.
+	if character:FindFirstChildOfClass("ForceField") then
+		return nil, false, 0, nil
+	end
+
+	local part, isHitbox = pickPart(character)
+	part = part or root
+
+	local screenPosition, onScreen = currentCamera:WorldToViewportPoint(part.Position)
+	if not onScreen then
+		return nil, false, 0, nil
+	end
+
+	local distance = (Vector2.new(screenPosition.X, screenPosition.Y) - mousePosition).Magnitude
+	if distance >= limit then
+		return nil, false, 0, nil
+	end
+
+	-- 180 means no angle limit, so far targets still lock.
+	if state.maxAngle < 180 then
+		local toPart = (part.Position - cameraCFrame.Position).Unit
+		local angle = math.deg(math.acos(math.clamp(cameraCFrame.LookVector:Dot(toPart), -1, 1)))
+		if angle > state.maxAngle then
+			return nil, false, 0, nil
+		end
+	end
+
+	if state.wallCheck and not isVisible(part.Position, character, humanoid) then
+		return nil, false, 0, nil
+	end
+
+	return part, isHitbox, distance, root
+end
+
+---Find the player closest to the cursor inside the fov and cache the aim part.
+---The current target stays locked while it runs, so it is not dropped at the fov edge.
+local function updateAim()
+	aimPart = nil
+
+	if not state.enabled then
+		lockedPlayer = nil
+		return
+	end
+
+	local mousePosition = userInputService:GetMouseLocation()
+	local cameraCFrame = currentCamera.CFrame
+
+	-- Keep the locked target while it is still valid inside a wider fov.
+	if lockedPlayer and lockedPlayer.Parent then
+		local part, isHitbox, _, root =
+			evaluateTarget(lockedPlayer, state.fov * STICKY_FOV_SCALE, mousePosition, cameraCFrame)
+		if part then
+			aimPart, aimIsHitbox, aimRoot = part, isHitbox, root
+			return
+		end
+	end
+
+	lockedPlayer = nil
+
+	local bestDistance = state.fov
+	local bestPlayer, bestPart, bestIsHitbox, bestRoot = nil, nil, false, nil
+
+	for _, player in ipairs(playersService:GetPlayers()) do
+		if player == localPlayer then
+			continue
+		end
+
+		local part, isHitbox, distance, root = evaluateTarget(player, bestDistance, mousePosition, cameraCFrame)
+		if not part then
+			continue
+		end
+
+		bestDistance = distance
+		bestPlayer = player
+		bestPart = part
+		bestIsHitbox = isHitbox
+		bestRoot = root
+	end
+
+	lockedPlayer = bestPlayer
+	aimPart, aimIsHitbox, aimRoot = bestPart, bestIsHitbox, bestRoot
+end
+
+---Create a gui in the hidden container.
+---@param name string
+---@param ignoreInset boolean
+---@return ScreenGui
+local function createGui(name, ignoreInset)
+	local gui = Instance.new("ScreenGui")
+	gui.Name = name
+	gui.IgnoreGuiInset = ignoreInset
+	gui.ResetOnSpawn = false
+	gui.DisplayOrder = 99
+
+	local parented = pcall(function()
+		gui.Parent = gethui()
+	end)
+	if not parented then
+		gui.Parent = localPlayer:WaitForChild("PlayerGui")
+	end
+
+	return gui
+end
+
+---Create the fov circle.
+local function createFovCircle()
+	fovGui = createGui("TangFov", true)
+
+	local circle = Instance.new("Frame")
+	circle.AnchorPoint = Vector2.new(0.5, 0.5)
+	circle.BackgroundTransparency = 1
+	circle.BorderSizePixel = 0
+	circle.Parent = fovGui
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0.5, 0)
+	corner.Parent = circle
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(255, 255, 255)
+	stroke.Thickness = 1.5
+	stroke.Transparency = 0.3
+	stroke.Parent = circle
+
+	fovCircle = circle
+end
+
+---Create the esp objects for a player.
+---@param player Player
+local function createEspObject(player)
+	local tracer = Instance.new("Frame")
+	tracer.AnchorPoint = Vector2.new(0.5, 0.5)
+	tracer.BorderSizePixel = 0
+	tracer.Visible = false
+	tracer.Parent = espGui
+
+	local box = Instance.new("Frame")
+	box.AnchorPoint = Vector2.new(0.5, 0.5)
+	box.BackgroundTransparency = 1
+	box.BorderSizePixel = 0
+	box.Visible = false
+	box.Parent = espGui
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Thickness = 1.5
+	stroke.Parent = box
+
+	local healthBack = Instance.new("Frame")
+	healthBack.AnchorPoint = Vector2.new(0.5, 0.5)
+	healthBack.BackgroundColor3 = Color3.new(0, 0, 0)
+	healthBack.BackgroundTransparency = 0.4
+	healthBack.BorderSizePixel = 0
+	healthBack.Visible = false
+	healthBack.Parent = espGui
+
+	local healthFill = Instance.new("Frame")
+	healthFill.AnchorPoint = Vector2.new(0, 1)
+	healthFill.Position = UDim2.fromScale(0, 1)
+	healthFill.Size = UDim2.fromScale(1, 1)
+	healthFill.BackgroundColor3 = Color3.fromRGB(0, 255, 80)
+	healthFill.BorderSizePixel = 0
+	healthFill.Parent = healthBack
+
+	local label = Instance.new("TextLabel")
+	label.AnchorPoint = Vector2.new(0.5, 1)
+	label.Size = UDim2.fromOffset(240, 16)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.GothamBold
+	label.TextSize = 12
+	label.TextColor3 = Color3.new(1, 1, 1)
+	label.TextStrokeTransparency = 0.4
+	label.Visible = false
+	label.Parent = espGui
+
+	espObjects[player] = {
+		tracer = tracer,
+		box = box,
+		stroke = stroke,
+		healthBack = healthBack,
+		healthFill = healthFill,
+		label = label,
+	}
+end
+
+---Remove the esp objects of a player.
+---@param player Player
+local function removeEspObject(player)
+	local object = espObjects[player]
+	if not object then
+		return
+	end
+
+	object.tracer:Destroy()
+	object.box:Destroy()
+	object.healthBack:Destroy()
+	object.label:Destroy()
+	espObjects[player] = nil
+end
+
+---Hide every esp element of an object.
+local function hideEspObject(object)
+	object.tracer.Visible = false
+	object.box.Visible = false
+	object.healthBack.Visible = false
+	object.label.Visible = false
+end
+
+---Update the esp for every player.
+local function updateEsp()
+	-- Tracers start from the top center of the screen.
+	local origin = Vector2.new(espGui.AbsoluteSize.X / 2, 0)
+	local cameraPosition = currentCamera.CFrame.Position
+
+	for _, player in ipairs(playersService:GetPlayers()) do
+		if player == localPlayer then
+			continue
+		end
+
+		local object = espObjects[player]
+		if not object then
+			createEspObject(player)
+			object = espObjects[player]
+		end
+
+		local character = player.Character
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		if not (state.espEnabled and root and humanoid and humanoid.Health > 0) then
+			hideEspObject(object)
+			continue
+		end
+
+		local distance = (root.Position - cameraPosition).Magnitude
+		if distance > state.espDistance then
+			hideEspObject(object)
+			continue
+		end
+
+		local screenPosition, onScreen = currentCamera:WorldToScreenPoint(root.Position)
+		if not onScreen then
+			hideEspObject(object)
+			continue
+		end
+
+		local top = currentCamera:WorldToScreenPoint(root.Position + Vector3.new(0, 2.8, 0))
+		local bottom = currentCamera:WorldToScreenPoint(root.Position - Vector3.new(0, 3.2, 0))
+		local height = math.abs(bottom.Y - top.Y)
+		local width = height * 0.55
+		local centerY = (top.Y + bottom.Y) / 2
+		local target = Vector2.new(screenPosition.X, screenPosition.Y)
+
+		local tracer = object.tracer
+		tracer.Visible = state.espTracers
+		if state.espTracers then
+			local delta = target - origin
+			tracer.BackgroundColor3 = state.espColor
+			tracer.Size = UDim2.fromOffset(delta.Magnitude, 1.5)
+			tracer.Position = UDim2.fromOffset((origin.X + target.X) / 2, (origin.Y + target.Y) / 2)
+			tracer.Rotation = math.deg(math.atan2(delta.Y, delta.X))
+		end
+
+		local box = object.box
+		box.Visible = state.espBoxes
+		if state.espBoxes then
+			object.stroke.Color = state.espColor
+			box.Size = UDim2.fromOffset(width, height)
+			box.Position = UDim2.fromOffset(target.X, centerY)
+		end
+
+		-- Green health bar on the left side of the character.
+		local healthBack = object.healthBack
+		healthBack.Visible = state.espHealth
+		if state.espHealth then
+			local ratio = math.clamp(humanoid.Health / math.max(humanoid.MaxHealth, 1), 0, 1)
+			healthBack.Size = UDim2.fromOffset(4, height)
+			healthBack.Position = UDim2.fromOffset(target.X - width / 2 - 6, centerY)
+			object.healthFill.Size = UDim2.fromScale(1, ratio)
+		end
+
+		local label = object.label
+		label.Visible = state.espNames
+		if state.espNames then
+			label.Text = string.format(
+				"%s [%dm] %d HP",
+				player.DisplayName,
+				math.floor(distance),
+				math.floor(humanoid.Health)
+			)
+			label.Position = UDim2.fromOffset(target.X, math.min(top.Y, bottom.Y) - 2)
+		end
+	end
+end
+
+---Find a heal tool by item name in the character or backpack.
+---@param itemName string
+---@return Tool?
+local function findItemTool(itemName)
+	local wanted = string.lower(itemName)
+	local backpack = localPlayer:FindFirstChildOfClass("Backpack")
+
+	for _, container in ipairs({ localPlayer.Character, backpack }) do
+		if not container then
+			continue
+		end
+
+		for _, tool in ipairs(container:GetChildren()) do
+			local item = tool:IsA("Tool") and tool:GetAttribute("Item")
+			if item and (string.lower(tostring(item)) == wanted or string.lower(tool.Name) == wanted) then
+				return tool
+			end
+		end
+	end
+
+	return nil
+end
+
+---Equip a heal tool and use it right away, then give the old tool back.
+---The game's server still runs its own timer for the effect.
+---@param itemName string
+local function useHealItem(itemName)
+	if healBusy then
+		return
+	end
+
+	local character = localPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then
+		return
+	end
+
+	if clientState and clientState.HealItem then
+		return
+	end
+
+	local tool = findItemTool(itemName)
+	if not tool then
+		return window:notify({ Title = "GOD", Text = "ไม่มี " .. itemName .. " ในกระเป๋า" })
+	end
+
+	healBusy = true
+
+	local previous = character:FindFirstChildOfClass("Tool")
+	if tool.Parent ~= character then
+		humanoid:EquipTool(tool)
+
+		local waited = 0
+		while tool.Parent ~= character and waited < 1 do
+			waited = waited + task.wait(0.03)
+		end
+	end
+
+	local duration = 3
+	if tool.Parent == character then
+		task.wait(0.05)
+		tool:Activate()
+
+		local item = clientConfig and clientConfig.Heal and clientConfig.Heal.Items[tool:GetAttribute("Item")]
+		duration = item and item.Time or duration
+		task.wait(duration + 0.3)
+	end
+
+	if previous and previous ~= tool and previous.Parent == localPlayer:FindFirstChildOfClass("Backpack") then
+		humanoid:EquipTool(previous)
+	end
+
+	healBusy = false
+end
+
+---Use heal items automatically when health or armor is low.
+local function updateAutoHeal()
+	if not (state.autoHeal or state.autoArmor) or healBusy then
+		return
+	end
+
+	local now = os.clock()
+	if now - lastAutoHeal < 0.25 then
+		return
+	end
+	lastAutoHeal = now
+
+	local character = localPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not humanoid or humanoid.Health <= 0 or humanoid.SeatPart then
+		return
+	end
+
+	local percent = humanoid.Health / humanoid.MaxHealth * 100
+	if state.autoHeal and percent < state.healPercent then
+		return task.spawn(useHealItem, state.healItem)
+	end
+
+	if state.autoArmor and (character:GetAttribute("Armor") or 0) <= 0 then
+		task.spawn(useHealItem, "Kevlar")
+	end
+end
+
+---Change the name shown above our own head. Only we see it, the server keeps the real name.
+---@param restore boolean
+local function applyOverheadName(restore)
+	local character = localPlayer.Character
+	if not character then
+		return
+	end
+
+	local text = restore and localPlayer.DisplayName or state.nameText
+	if text == "" then
+		return
+	end
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if humanoid and humanoid.DisplayName ~= text then
+		humanoid.DisplayName = text
+	end
+
+	-- Custom name tags made by the game.
+	for _, descendant in ipairs(character:GetDescendants()) do
+		if not descendant:IsA("TextLabel") or not descendant:FindFirstAncestorOfClass("BillboardGui") then
+			continue
+		end
+
+		local current = descendant.Text
+		if current == localPlayer.DisplayName or current == localPlayer.Name or current == lastNameText then
+			descendant.Text = text
+		end
+	end
+
+	lastNameText = text
+end
+
+---Per frame update: reroll shot, refresh target, move fov circle, draw esp.
+local function onRenderStep()
+	currentCamera = workspace.CurrentCamera
+
+	local now = os.clock()
+	if now - lastRoll >= ROLL_INTERVAL then
+		lastRoll = now
+		state.redirect = math.random(1, 100) <= state.hitChance
+		rolledHead = math.random(1, 2) == 1
+	end
+
+	updateAim()
+	updateEsp()
+
+	updateAutoHeal()
+
+	if state.nameEnabled and now - lastNameApply >= 1 then
+		lastNameApply = now
+		applyOverheadName(false)
+	end
+
+	-- Stamina lives in the game's client state, keep it full.
+	if state.infiniteStamina and clientState then
+		pcall(function()
+			clientState.Stamina = clientState.StaminaMax or 150
+			clientState.Exhausted = false
+		end)
+	end
+
+	fovCircle.Visible = state.enabled and state.showFov
+	fovCircle.Size = UDim2.fromOffset(state.fov * 2, state.fov * 2)
+
+	local mousePosition = userInputService:GetMouseLocation()
+	fovCircle.Position = UDim2.fromOffset(mousePosition.X, mousePosition.Y)
+end
+
+---Install the namecall hook. Redirects bullet raycasts only, the game sends its own remotes.
+local function installHook()
+	local oldNamecall
+	oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+		local method = getnamecallmethod()
+
+		if not TangHub.alive or checkcaller() then
+			return oldNamecall(self, ...)
+		end
+
+		if state.antiKick and self == localPlayer and (method == "Kick" or method == "Destroy" or method == "Remove") then
+			kickBlocked = kickBlocked + 1
+			return
+		end
+
+		if not (state.enabled and state.redirect and aimPart) then
+			return oldNamecall(self, ...)
+		end
+
+		-- Only touch bullets while a weapon is equipped.
+		if clientState and clientState.Equipped ~= true then
+			return oldNamecall(self, ...)
+		end
+
+		if state.rayMode and (method == "ViewportPointToRay" or method == "ScreenPointToRay") and self == currentCamera then
+			local aimPosition = getAimPosition()
+			local ray = oldNamecall(self, ...)
+			if not aimPosition then
+				return ray
+			end
+
+			local offset = aimPosition - ray.Origin
+			if offset.Magnitude < 0.01 then
+				return ray
+			end
+
+			-- Keep the ray long enough to reach far targets.
+			local length = math.max(ray.Direction.Magnitude, offset.Magnitude + RAY_EXTRA_LENGTH)
+			return Ray.new(ray.Origin, offset.Unit * length)
+		end
+
+		if state.raycastMode and method == "Raycast" and self == workspace then
+			local origin, direction = ...
+			if typeof(origin) ~= "Vector3" or typeof(direction) ~= "Vector3" then
+				return oldNamecall(self, ...)
+			end
+
+			if direction.Magnitude < RAYCAST_MIN_LENGTH then
+				return oldNamecall(self, ...)
+			end
+
+			if (origin - currentCamera.CFrame.Position).Magnitude > RAYCAST_MAX_ORIGIN_OFFSET then
+				return oldNamecall(self, ...)
+			end
+
+			local aimPosition = getAimPosition()
+			if not aimPosition then
+				return oldNamecall(self, ...)
+			end
+
+			local offset = aimPosition - origin
+			if offset.Magnitude < 0.01 then
+				return oldNamecall(self, ...)
+			end
+
+			-- Stretch the ray so far targets are still reached.
+			local length = math.max(direction.Magnitude, offset.Magnitude + RAY_EXTRA_LENGTH)
+			return oldNamecall(self, origin, offset.Unit * length, select(3, ...))
+		end
+
+		return oldNamecall(self, ...)
+	end))
+end
+
+---Block client side kicks, both the colon form and the direct call form.
+local function installAntiKick()
+	local kickFunction = localPlayer.Kick
+	local destroyFunction = localPlayer.Destroy
+
+	local originalKick
+	local kickOk = pcall(function()
+		originalKick = hookfunction(kickFunction, newcclosure(function(player, ...)
+			if TangHub.alive and state.antiKick and player == localPlayer then
+				kickBlocked = kickBlocked + 1
+				return
+			end
+			return originalKick(player, ...)
+		end))
+	end)
+
+	local originalDestroy
+	local destroyOk = pcall(function()
+		originalDestroy = hookfunction(destroyFunction, newcclosure(function(player, ...)
+			if TangHub.alive and state.antiKick and player == localPlayer then
+				kickBlocked = kickBlocked + 1
+				return
+			end
+			return originalDestroy(player, ...)
+		end))
+	end)
+
+	return kickOk and destroyOk
+end
+
+---Build the menu.
+---@param Library table
+local function buildMenu(Library)
+	window = Library.new({ Title = "TANG HUB", Subtitle = "ภาษาไทย" })
+
+	window:addSection("เมนูหลัก")
+	local aimTab = window:addTab({ Name = "ล็อกเป้า" })
+	local espTab = window:addTab({ Name = "มองเห็น" })
+	local playerTab = window:addTab({ Name = "ผู้เล่น" })
+	window:addSettings()
+	window:addCredits("TANG HUB")
+
+	aimTab:addGroup({ Title = "Silent Aim", Description = "ปรับการล็อกเป้า" })
+	aimTab:addToggle({
+		Name = "เปิด Silent Aim",
+		Description = "เล็งปกติ กระสุนจะไปหาเป้าในวง FOV",
+		Callback = function(value)
+			state.enabled = value
+		end,
+	})
+	aimTab:addToggle({
+		Name = "แสดงวง FOV",
+		Default = true,
+		Callback = function(value)
+			state.showFov = value
+		end,
+	})
+	aimTab:addToggle({
+		Name = "เช็คกำแพง",
+		Description = "ไม่ล็อกคนที่อยู่หลังกำแพง",
+		Default = true,
+		Callback = function(value)
+			state.wallCheck = value
+		end,
+	})
+	aimTab:addToggle({
+		Name = "ล็อกคนในรถ",
+		Description = "ล็อกคนขับและคนนั่งในรถ",
+		Default = true,
+		Callback = function(value)
+			state.targetSeated = value
+		end,
+	})
+	aimTab:addSlider({
+		Name = "ขนาดวง FOV",
+		Min = 30,
+		Max = 500,
+		Default = 150,
+		Increment = 5,
+		Callback = function(value)
+			state.fov = value
+		end,
+	})
+	aimTab:addSlider({
+		Name = "โอกาสโดน (%)",
+		Min = 1,
+		Max = 100,
+		Default = 100,
+		Callback = function(value)
+			state.hitChance = value
+		end,
+	})
+	aimTab:addSlider({
+		Name = "ดักเป้าเคลื่อนที่ (ms)",
+		Description = "นำหน้าเป้าที่วิ่ง ลอง 50-150 ถ้ายังพลาดคนวิ่ง",
+		Min = 0,
+		Max = 200,
+		Default = 0,
+		Increment = 5,
+		Callback = function(value)
+			state.prediction = value
+		end,
+	})
+	aimTab:addToggle({
+		Name = "ดักเป้าอัตโนมัติ (ตาม Ping)",
+		Description = "นำหน้าเป้าที่วิ่งตาม Ping ของเรา ถ้าใช้ ms ด้านบนให้ปิดอันนี้",
+		Default = true,
+		Callback = function(value)
+			state.autoPredict = value
+		end,
+	})
+	aimTab:addSlider({
+		Name = "มุมสูงสุด (องศา)",
+		Description = "ต่ำ = ปลอดภัย 180 = ไม่จำกัด เสี่ยงโดนเตะ",
+		Min = 1,
+		Max = 180,
+		Default = 45,
+		Callback = function(value)
+			state.maxAngle = value
+		end,
+	})
+	aimTab:addDropdown({
+		Name = "จุดที่ยิง",
+		Options = { "หัว", "ลำตัว", "สุ่ม" },
+		Default = "หัว",
+		Callback = function(value)
+			state.targetMode = value
+		end,
+	})
+	aimTab:addMultiDropdown({
+		Name = "วิธีล็อก",
+		Description = "Ray กล้องเสี่ยงโดนเตะ แนะนำใช้ Raycast อย่างเดียว",
+		Options = { "Ray กล้อง", "Raycast" },
+		Default = { "Raycast" },
+		Callback = function(list)
+			state.rayMode = table.find(list, "Ray กล้อง") ~= nil
+			state.raycastMode = table.find(list, "Raycast") ~= nil
+		end,
+	})
+
+	aimTab:addGroup({ Title = "ป้องกัน", Description = "ลดโอกาสโดนเตะ" })
+	aimTab:addToggle({
+		Name = "กันเตะฝั่งไคลเอนต์",
+		Description = "บล็อก Kick/Destroy ที่สั่งจากสคริปต์ในเกม เซิร์ฟเวอร์เตะเองกันไม่ได้",
+		Default = true,
+		Callback = function(value)
+			state.antiKick = value
+		end,
+	})
+
+	espTab:addGroup({ Title = "ESP", Description = "มองเห็นผู้เล่นทะลุกำแพง" })
+	espTab:addToggle({
+		Name = "เปิด ESP",
+		Callback = function(value)
+			state.espEnabled = value
+		end,
+	})
+	espTab:addToggle({
+		Name = "เส้นโยง",
+		Default = true,
+		Callback = function(value)
+			state.espTracers = value
+		end,
+	})
+	espTab:addToggle({
+		Name = "กรอบ",
+		Default = true,
+		Callback = function(value)
+			state.espBoxes = value
+		end,
+	})
+	espTab:addToggle({
+		Name = "หลอดเลือด",
+		Default = true,
+		Callback = function(value)
+			state.espHealth = value
+		end,
+	})
+	espTab:addToggle({
+		Name = "ชื่อ / ระยะ / เลือด",
+		Default = true,
+		Callback = function(value)
+			state.espNames = value
+		end,
+	})
+	espTab:addSlider({
+		Name = "ระยะสูงสุด",
+		Min = 100,
+		Max = 3000,
+		Default = 1500,
+		Increment = 50,
+		Callback = function(value)
+			state.espDistance = value
+		end,
+	})
+	espTab:addColorpicker({
+		Name = "สี ESP",
+		Default = state.espColor,
+		Callback = function(color)
+			state.espColor = color
+		end,
+	})
+
+	playerTab:addGroup({ Title = "ผู้เล่น", Description = "ปรับการเคลื่อนไหว" })
+	playerTab:addToggle({
+		Name = "วิ่งไม่จำกัด",
+		Description = "สตามินาไม่ลด วิ่งเร็วได้ตลอด ความเร็วเท่าที่เกมให้",
+		Callback = function(value)
+			state.infiniteStamina = value
+		end,
+	})
+
+	playerTab:addGroup({ Title = "ชื่อบนหัว", Description = "เห็นเฉพาะในจอเรา คนอื่นยังเห็นชื่อจริง" })
+	playerTab:addTextbox({
+		Name = "ชื่อที่ต้องการ",
+		Default = "GOD",
+		Placeholder = "พิมพ์ชื่อ",
+		Callback = function(text)
+			state.nameText = text
+			if state.nameEnabled then
+				applyOverheadName(false)
+			end
+		end,
+	})
+	playerTab:addToggle({
+		Name = "เปลี่ยนชื่อบนหัว",
+		Callback = function(value)
+			state.nameEnabled = value
+			applyOverheadName(not value)
+		end,
+	})
+
+	playerTab:addGroup({ Title = "GOD ฟื้นฟู", Description = "ใช้ยาและเกราะแบบกดครั้งเดียว" })
+	playerTab:addButton({
+		Name = "GOD เกราะ",
+		Description = "หยิบ Kevlar ใส่ทันที",
+		Callback = function()
+			task.spawn(useHealItem, "Kevlar")
+		end,
+	})
+	playerTab:addButton({
+		Name = "GOD ยา",
+		Description = "หยิบยาที่เลือกใช้ทันที",
+		Callback = function()
+			task.spawn(useHealItem, state.healItem)
+		end,
+	})
+	playerTab:addDropdown({
+		Name = "ไอเทมฟื้นเลือด",
+		Options = { "Medkit", "Bandage" },
+		Default = "Medkit",
+		Callback = function(value)
+			state.healItem = value
+		end,
+	})
+	playerTab:addToggle({
+		Name = "GOD ออโต้ยา",
+		Description = "ใช้ยาเองเมื่อเลือดต่ำกว่าที่ตั้งไว้",
+		Callback = function(value)
+			state.autoHeal = value
+		end,
+	})
+	playerTab:addSlider({
+		Name = "ใช้ยาเมื่อเลือดต่ำกว่า (%)",
+		Min = 10,
+		Max = 90,
+		Default = 50,
+		Increment = 5,
+		Callback = function(value)
+			state.healPercent = value
+		end,
+	})
+	playerTab:addToggle({
+		Name = "GOD ออโต้เกราะ",
+		Description = "ใส่ Kevlar เองเมื่อเกราะหมด",
+		Callback = function(value)
+			state.autoArmor = value
+		end,
+	})
+
+	window:notify({ Title = "TANG HUB", Text = "โหลดสำเร็จ กด RightShift เพื่อซ่อนเมนู" })
+end
+
+---Cleanup everything this execution created.
+function TangHub.detach()
+	TangHub.alive = false
+
+	for _, connection in ipairs(TangHub.connections) do
+		connection:Disconnect()
+	end
+
+	if fovGui then
+		fovGui:Destroy()
+	end
+
+	if espGui then
+		espGui:Destroy()
+	end
+
+	if window then
+		window:destroy()
+	end
+end
+
+---Load the ui, install hooks and start the loop.
+local function initializeScript()
+	-- Skip the default menu, we build our own.
+	getgenv().TangHubLibraryOnly = true
+
+	local body = fetch(UI_URL)
+	if not body then
+		return warn("load failed")
+	end
+
+	local chunk, compileError = loadstring(body)
+	if not chunk then
+		return warn("compile error: " .. tostring(compileError))
+	end
+
+	local success, Library = pcall(chunk)
+	if not success then
+		return warn("run error: " .. tostring(Library))
+	end
+
+	clientHitboxes = loadGameModule("ClientHitboxes")
+	hitboxModel = loadGameModule("HitboxModel")
+	clientState = loadGameModule("ClientState")
+	clientConfig = loadGameModule("Config")
+
+	createFovCircle()
+	espGui = createGui("TangEsp", false)
+	buildMenu(Library)
+	installHook()
+	local antiKickOk = installAntiKick()
+
+	window:notify({
+		Title = "กันเตะ",
+		Text = antiKickOk and "ติดตั้งกันเตะฝั่งไคลเอนต์แล้ว" or "ติดตั้งบางส่วน ใช้ได้เฉพาะ namecall",
+	})
+
+	window:notify({
+		Title = "Hitbox",
+		Text = clientHitboxes and "พบ Hitbox ของเกม ล็อกตรงจุดที่เซิร์ฟเช็ค" or "ไม่พบ Hitbox ใช้ตัวละครแทน",
+	})
+
+	table.insert(TangHub.connections, runService.RenderStepped:Connect(onRenderStep))
+	table.insert(TangHub.connections, playersService.PlayerRemoving:Connect(removeEspObject))
+end
+
+---Called when initialization errors.
+---@param errorMessage string
+local function onInitializeError(errorMessage)
+	warn("[TANG HUB] failed to initialize.")
+	warn(errorMessage)
+	warn(debug.traceback())
+	TangHub.detach()
+end
+
+xpcall(initializeScript, onInitializeError)
